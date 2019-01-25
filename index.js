@@ -47,6 +47,7 @@ let currentShardId = null;
 let lastShardDate = null;
 let activeDates = {};
 
+let bulkSize = 500;
 let bulk = [];
 
 const es = new elasticsearch.Client({
@@ -126,7 +127,7 @@ function addToBulk(item) {
 async function triggerBulkIndexing(force) {
 	if (!bulk.length) return null;
 	
-	if (!force && bulk.length / 2 < 250) return null;
+	if (!force && bulk.length / 2 < bulkSize) return null;
 	
 	let result = await es.bulk({body: bulk});
 	

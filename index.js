@@ -183,10 +183,10 @@ function streamShard(mysqlShard, shardDate) {
 				async function (row, enc, next) {
 					try {
 						let id = row.libraryID + '/' + row.key;
-						activeDates[id] = row.timestamp;
 						let item = await getItem(id);
 						if(item) {
 							this.push(item);
+							activeDates[id] = row.timestamp;
 						}
 					}
 					catch (err) {

@@ -86,7 +86,13 @@ async function delay(ms) {
 }
 
 async function getItem(id) {
-	let data = await s3.getObject({Key: id}).promise();
+	let data;
+	try {
+		data = await s3.getObject({Key: id}).promise();
+	} catch(err) {
+		console.log(id);
+		throw err;
+	}
 	
 	let json = data.Body;
 	

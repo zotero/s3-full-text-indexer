@@ -79,7 +79,13 @@ function removeActiveDate(id) {
 	}
 }
 
-async function prepareToIndex(id) {
+async function delay(ms) {
+	return new Promise(function (resolve) {
+		setTimeout(resolve, ms);
+	})
+}
+
+async function getItem(id) {
 	let data = await s3.getObject({Key: id}).promise();
 	
 	let json = data.Body;
@@ -90,27 +96,31 @@ async function prepareToIndex(id) {
 	
 	json = JSON.parse(json.toString());
 	
+	return json;
+}
+
+function addToBulk(item) {
 	bulk.push({
 		index: {
 			_index: config.get('es.index'),
 			_type: config.get('es.type'),
-			_id: id,
-			_version: json.version,
+			_id: item.libraryID + '/' + item.key,
+			_version: item.version,
 			_version_type: 'external_gt',
-			_routing: json.libraryID,
+			_routing: item.libraryID,
 		}
 	});
 	
 	bulk.push({
-		libraryID: json.libraryID,
-		content: json.content
+		libraryID: item.libraryID,
+		content: item.content
 	});
 }
 
-async function triggerBulkIndex(force) {
+async function triggerBulkIndexing(force) {
 	if (!bulk.length) return null;
 	
-	if (!force && bulk.length / 2 < 500) return null;
+	if (!force && bulk.length / 2 < 250) return null;
 	
 	let result = await es.bulk({body: bulk});
 	
@@ -119,8 +129,14 @@ async function triggerBulkIndex(force) {
 			if (item.index.error.type === 'version_conflict_engine_exception') {
 				numConflicts++;
 			}
+			else if (item.index.error.type === 'es_rejected_execution_exception') {
+				console.log(item.index.error);
+				await delay(1000);
+				console.log('Retrying..');
+				return await triggerBulkIndexing(force);
+			}
 			else {
-				throw new Error(item.index.error);
+				throw new Error(JSON.stringify(item.index.error));
 			}
 		}
 		
@@ -153,8 +169,24 @@ function streamShard(mysqlShard, shardDate) {
 					try {
 						let id = row.libraryID + '/' + row.key;
 						activeDates[id] = row.timestamp;
-						await prepareToIndex(id);
-						await triggerBulkIndex();
+						let item = await getItem(id);
+						this.push(item);
+					}
+					catch (err) {
+						return reject(err);
+					}
+					next();
+				}
+			))
+			.pipe(through2Concurrent(
+				{
+					objectMode: true,
+					maxConcurrency: 1
+				},
+				async function (item, enc, next) {
+					try {
+						addToBulk(item);
+						await triggerBulkIndexing();
 					}
 					catch (err) {
 						return reject(err);
@@ -166,12 +198,12 @@ function streamShard(mysqlShard, shardDate) {
 			})
 			.on('end', async function () {
 				try {
-					await triggerBulkIndex(true);
+					await triggerBulkIndexing(true);
 				}
 				catch (err) {
 					return reject(err);
 				}
-				resolve(shardDate);
+				resolve();
 			});
 	});
 }
@@ -275,25 +307,19 @@ async function main() {
 	clearInterval(printInterval);
 	clearInterval(saveInterval);
 	
-	print();
-	
 	console.log('finished');
 }
 
-function print() {
+let printInterval = setInterval(function () {
 	console.log(JSON.stringify({
 		currentShardId,
-		processedPerSecond: Math.floor(numProcessed - numProcessedPrev),
+		processedPerSecond: Math.floor((numProcessed - numProcessedPrev) / 10),
 		numProcessed,
 		numConflicts,
 		lastShardDate
 	}));
-}
-
-let printInterval = setInterval(function () {
-	print();
 	numProcessedPrev = numProcessed;
-}, 1000 * 5);
+}, 1000 * 10);
 
 let saveInterval = setInterval(function () {
 	if (lastShardDate) {
@@ -302,7 +328,6 @@ let saveInterval = setInterval(function () {
 }, 1000 * 10);
 
 process.on('unhandledRejection', function (err) {
-	print();
 	throw err;
 });
 

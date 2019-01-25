@@ -158,7 +158,7 @@ function streamShard(mysqlShard, shardDate) {
 		let sql = `
 				SELECT I.libraryID, I.key, IFT.timestamp
 				FROM itemFulltext IFT
-				LEFT JOIN items I USING (itemID)
+				JOIN items I USING (itemID)
 				${shardDate ? (`WHERE IFT.timestamp >= '${shardDate}'`) : ''}
 				ORDER BY IFT.timestamp
 			`;

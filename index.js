@@ -32,6 +32,7 @@ const elasticsearch = require('elasticsearch');
 const AWS = require('aws-sdk');
 const zlib = require('zlib');
 const fs = require('fs');
+const util = require('util');
 
 const s3 = new AWS.S3(config.get('s3'));
 
@@ -49,6 +50,8 @@ let currentShardId = null;
 
 let lastShardDate = null;
 let activeDates = {};
+
+let mysqlShard = null;
 
 let bulkSize = 500;
 let bulk = [];
@@ -284,7 +287,7 @@ async function processShards() {
 	for (let shardRow of shardRows) {
 		currentShardId = shardRow.shardID;
 		
-		let mysqlShard = await getShardReaderConnection(
+		mysqlShard = await getShardReaderConnection(
 			mysqlMaster,
 			shardRow.shardHostID,
 			shardRow.db
@@ -349,3 +352,13 @@ process.on('unhandledRejection', function (err) {
 });
 
 main();
+
+function watcher() {
+	if(!numProcessedPrev) {
+		console.log(util.inspect(mysqlShard));
+		console.log({bulk});
+		console.log({activeDates});
+	}
+}
+
+setInterval(watcher, 1000 * 60 * 5);

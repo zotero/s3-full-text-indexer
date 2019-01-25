@@ -31,10 +31,13 @@ const config = require('config');
 const elasticsearch = require('elasticsearch');
 const AWS = require('aws-sdk');
 const zlib = require('zlib');
+const fs = require('fs');
 
 const s3 = new AWS.S3(config.get('s3'));
 
 let dbPath = './db/';
+
+let s3MissingKeysLog = 's3_missing.log';
 
 let sqliteShard = null;
 
@@ -90,8 +93,13 @@ async function getItem(id) {
 	let data;
 	try {
 		data = await s3.getObject({Key: id}).promise();
-	} catch(err) {
-		console.log(id);
+	}
+	catch (err) {
+		console.log('S3 error for key ' + id + ': ' + err.code);
+		if (err.code === 'NoSuchKey') {
+			fs.appendFileSync(s3MissingKeysLog, id + '\n');
+			return null;
+		}
 		throw err;
 	}
 	
@@ -177,7 +185,9 @@ function streamShard(mysqlShard, shardDate) {
 						let id = row.libraryID + '/' + row.key;
 						activeDates[id] = row.timestamp;
 						let item = await getItem(id);
-						this.push(item);
+						if(item) {
+							this.push(item);
+						}
 					}
 					catch (err) {
 						return reject(err);

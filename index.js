@@ -297,9 +297,9 @@ async function processShards() {
 			'Failed to get a reader connection for shard ' + shardRow.shardID
 		);
 		
-		let shardDate = await getShardDate(shardRow.shardID);
-		console.log(`Streaming shard ${shardRow.shardID} from ${shardDate}`);
-		await streamShard(mysqlShard, shardDate);
+		lastShardDate = await getShardDate(shardRow.shardID);
+		console.log(`Streaming shard ${shardRow.shardID} from ${lastShardDate}`);
+		await streamShard(mysqlShard, lastShardDate);
 		
 		mysqlShard.close();
 		

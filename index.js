@@ -44,6 +44,7 @@ let sqliteShard = null;
 
 let numProcessedPrev = 0;
 let numProcessed = 0;
+let stalled = false;
 let numConflicts = 0;
 
 let currentShardId = null;
@@ -338,6 +339,7 @@ let printInterval = setInterval(function () {
 		numConflicts,
 		lastShardDate
 	}));
+	stalled = !Math.floor((numProcessed - numProcessedPrev) / 10);
 	numProcessedPrev = numProcessed;
 }, 1000 * 10);
 
@@ -354,11 +356,9 @@ process.on('unhandledRejection', function (err) {
 main();
 
 function watcher() {
-	if(!numProcessedPrev) {
-		console.log(util.inspect(mysqlShard));
-		console.log({bulk});
-		console.log({activeDates});
+	if (stalled) {
+		process.exit(1);
 	}
 }
 
-setInterval(watcher, 1000 * 60 * 5);
+setInterval(watcher, 1000 * 60 * 1);

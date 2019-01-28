@@ -54,7 +54,7 @@ let activeDates = {};
 
 let mysqlShard = null;
 
-let bulkSize = 500;
+let bulkSize = 50;
 let bulk = [];
 
 const es = new elasticsearch.Client({
@@ -178,7 +178,7 @@ function streamShard(mysqlShard, shardDate) {
 		let params = [shardDate];
 		
 		mysqlShard.query(sql, params)
-			.stream({highWaterMark: 1024})
+			.stream({highWaterMark: 1})
 			.pipe(through2Concurrent(
 				{
 					objectMode: true,

@@ -1,5 +1,7 @@
 module.exports = {
-	concurrency: 10,
+	mysqlRowsLimit: 100000,
+	s3Concurrency: 10,
+	esBulkSize: 50,
 	mysql: {
 		host: '',
 		user: '',

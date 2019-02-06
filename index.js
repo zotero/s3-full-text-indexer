@@ -23,16 +23,15 @@
  ***** END LICENSE BLOCK *****
  */
 
-const mysql2 = require('mysql2');
 const mysql2Promise = require('mysql2/promise');
 const sqlite = require('sqlite');
 const through2Concurrent = require('through2-concurrent');
+const {Readable} = require('stream');
 const config = require('config');
 const elasticsearch = require('elasticsearch');
 const AWS = require('aws-sdk');
 const zlib = require('zlib');
 const fs = require('fs');
-const util = require('util');
 
 const s3 = new AWS.S3(config.get('s3'));
 
@@ -42,19 +41,14 @@ let s3MissingKeysLog = 's3_missing.log';
 
 let sqliteShard = null;
 
-let numProcessedPrev = 0;
+let numIndexedPrev = 0;
+let numIndexed = 0;
 let numProcessed = 0;
-let stalled = false;
 let numConflicts = 0;
 
+let lastShardDate = null;
 let currentShardId = null;
 
-let lastShardDate = null;
-let activeDates = {};
-
-let mysqlShard = null;
-
-let bulkSize = 50;
 let bulk = [];
 
 const es = new elasticsearch.Client({
@@ -76,15 +70,6 @@ async function setShardDate(shardID, shardDate) {
 		'INSERT OR REPLACE INTO shard (shardID, shardDate) VALUES (?,?)',
 		[shardID, shardDate]
 	);
-}
-
-function removeActiveDate(id) {
-	let date = activeDates[id];
-	delete activeDates[id];
-	let earliestDate = Object.values(activeDates).sort()[0];
-	if (!earliestDate || date < earliestDate) {
-		lastShardDate = date;
-	}
 }
 
 async function delay(ms) {
@@ -139,7 +124,7 @@ function addToBulk(item) {
 async function triggerBulkIndexing(force) {
 	if (!bulk.length) return null;
 	
-	if (!force && bulk.length / 2 < bulkSize) return null;
+	if (!force && bulk.length / 2 < config.get('esBulkSize')) return null;
 	
 	let result = await es.bulk({body: bulk});
 	
@@ -158,63 +143,98 @@ async function triggerBulkIndexing(force) {
 				throw new Error(JSON.stringify(item.index.error));
 			}
 		}
-		
-		removeActiveDate(item.index._id);
-		numProcessed++;
+		numIndexed++;
 	}
 	
 	bulk = [];
 }
 
-function streamShard(mysqlShard, shardDate) {
-	return new Promise(function (resolve, reject) {
-		let sql = `
-				SELECT I.libraryID, I.key, IFT.timestamp
-				FROM itemFulltext IFT
-				JOIN items I USING (itemID)
-				${shardDate ? (`WHERE IFT.timestamp >= '${shardDate}'`) : ''}
-				ORDER BY IFT.timestamp
-			`;
-		let params = [shardDate];
+async function itemExists(libraryID, key) {
+	try {
+		await es.get({
+			index: config.get('es.index'),
+			type: config.get('es.type'),
+			routing: libraryID,
+			id: libraryID + '/' + key
+		});
+	}
+	catch (err) {
+		if (err.status === 404) {
+			return false;
+		}
+		throw err;
+	}
+	
+	return true;
+}
+
+async function processShardChunk(mysqlShard, shardDate) {
+	let [rows] = await mysqlShard.execute(`
+			SELECT I.libraryID, I.key, IFT.timestamp
+			FROM itemFulltext IFT
+			JOIN items I USING (itemID)
+			${shardDate ? (`WHERE IFT.timestamp >= '${shardDate}'`) : ''}
+			ORDER BY IFT.timestamp
+			LIMIT ${config.get('mysqlRowsLimit')}
+	`);
+	
+	if (!rows.length) return null;
+	
+	let nextShardDate = rows[rows.length - 1].timestamp;
+	
+	if (nextShardDate === shardDate) return null;
+	
+	await new Promise(function (resolve, reject) {
+		let rowsStream = new Readable({
+			objectMode: true,
+			read() {
+				let row = rows.shift();
+				if (row && row.timestamp === nextShardDate) row = null;
+				this.push(row);
+			}
+		});
 		
-		mysqlShard.query(sql, params)
-			.stream({highWaterMark: 1})
-			.pipe(through2Concurrent(
-				{
-					objectMode: true,
-					maxConcurrency: config.get('concurrency')
-				},
-				async function (row, enc, next) {
-					try {
-						let id = row.libraryID + '/' + row.key;
-						let item = await getItem(id);
-						if(item) {
+		let s3Stream = through2Concurrent(
+			{
+				objectMode: true,
+				maxConcurrency: config.get('s3Concurrency')
+			},
+			async function (row, enc, next) {
+				try {
+					numProcessed++;
+					if (!(await itemExists(row.libraryID, row.key))) {
+						let item = await getItem(row.libraryID + '/' + row.key);
+						if (item) {
 							this.push(item);
-							activeDates[id] = row.timestamp;
 						}
 					}
-					catch (err) {
-						return reject(err);
-					}
-					next();
 				}
-			))
-			.pipe(through2Concurrent(
-				{
-					objectMode: true,
-					maxConcurrency: 1
-				},
-				async function (item, enc, next) {
-					try {
-						addToBulk(item);
-						await triggerBulkIndexing();
-					}
-					catch (err) {
-						return reject(err);
-					}
-					next();
+				catch (err) {
+					return reject(err);
 				}
-			))
+				
+				next();
+			}
+		);
+		
+		let indexStream = through2Concurrent(
+			{
+				objectMode: true,
+				maxConcurrency: 1
+			},
+			async function (item, enc, next) {
+				try {
+					addToBulk(item);
+					await triggerBulkIndexing();
+				}
+				catch (err) {
+					return reject(err);
+				}
+				next();
+			}
+		);
+		
+		indexStream
 			.on('data', function () {
 			})
 			.on('end', async function () {
@@ -226,24 +246,26 @@ function streamShard(mysqlShard, shardDate) {
 				}
 				resolve();
 			});
+		
+		rowsStream.pipe(s3Stream).pipe(indexStream);
 	});
+	
+	return nextShardDate;
 }
 
 async function createReaderConnection(connectionInfo) {
-	return new Promise(function (resolve, reject) {
-		let connection = mysql2.createConnection(connectionInfo);
-		connection.connect(function (err) {
-			if (err) return reject(err);
-			connection.query("SHOW GLOBAL VARIABLES LIKE 'innodb_read_only'",
-				function (err, result) {
-					if (err) return reject(err);
-					if (result[0] && result[0].Value === 'ON') return resolve(connection);
-					connection.close();
-					return resolve();
-				}
-			);
-		});
-	});
+	let connection = await mysql2Promise.createConnection(connectionInfo);
+	
+	let [rows] = await connection.execute(
+		"SHOW GLOBAL VARIABLES LIKE 'innodb_read_only'"
+	);
+	
+	if (!rows[0] || rows[0].Value !== 'ON') {
+		connection.close();
+		return null;
+	}
+	
+	return connection;
 }
 
 async function getShardReaderConnection(mysqlMaster, shardHostID, shardDb) {
@@ -288,7 +310,7 @@ async function processShards() {
 	for (let shardRow of shardRows) {
 		currentShardId = shardRow.shardID;
 		
-		mysqlShard = await getShardReaderConnection(
+		let mysqlShard = await getShardReaderConnection(
 			mysqlMaster,
 			shardRow.shardHostID,
 			shardRow.db
@@ -300,13 +322,12 @@ async function processShards() {
 		
 		lastShardDate = await getShardDate(shardRow.shardID);
 		console.log(`Streaming shard ${shardRow.shardID} from ${lastShardDate}`);
-		await streamShard(mysqlShard, lastShardDate);
 		
-		mysqlShard.close();
-		
-		if (lastShardDate) {
+		while (lastShardDate = await processShardChunk(mysqlShard, lastShardDate)) {
 			await setShardDate(currentShardId, lastShardDate);
 		}
+		
+		mysqlShard.close();
 	}
 	
 	mysqlMaster.close();
@@ -326,7 +347,6 @@ async function main() {
 	console.timeEnd('total time');
 	
 	clearInterval(printInterval);
-	clearInterval(saveInterval);
 	
 	console.log('finished');
 }
@@ -334,31 +354,18 @@ async function main() {
 let printInterval = setInterval(function () {
 	console.log(JSON.stringify({
 		currentShardId,
-		processedPerSecond: Math.floor((numProcessed - numProcessedPrev) / 10),
+		processedPerSecond: Math.floor((numIndexed - numIndexedPrev) / 10),
 		numProcessed,
+		numIndexed,
 		numConflicts,
 		lastShardDate
 	}));
-	stalled = !Math.floor((numProcessed - numProcessedPrev) / 10);
-	numProcessedPrev = numProcessed;
+	numIndexedPrev = numIndexed;
 }, 1000 * 10);
 
-let saveInterval = setInterval(function () {
-	if (lastShardDate) {
-		setShardDate(currentShardId, lastShardDate);
-	}
-}, 1000 * 10);
 
 process.on('unhandledRejection', function (err) {
 	throw err;
 });
 
 main();
-
-function watcher() {
-	if (stalled) {
-		process.exit(1);
-	}
-}
-
-setInterval(watcher, 1000 * 60 * 1);
